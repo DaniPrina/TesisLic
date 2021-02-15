@@ -1,0 +1,247 @@
+---
+title: "Cmus - Estadística Masa de Cebo Ingerida"
+author: "Dani"
+date: "3/10/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, error = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(car)
+library(TMB)
+library(glmmTMB)
+library(lme4)
+library (multcomp)
+library(DHARMa)
+library(PMCMRplus)
+library(PMCMR)
+
+Cmus <- read.delim("Cmus.csv")
+
+```
+
+El objetivo del trabajo, brevemente, era ver si las hormigas rechazaban un amargante que se le suele poner a los cebos azucarados (Bitrex). Entonces, se les ofreció a las hormigas cebo con diferentes concentraciones de amargante, para ver qué rango era el aceptado. Esto mismo para 3 grados de motivación del nido (porque si están hambreadas no da igual que si están satisfechas).  
+Así que, para esta duda particular tengo:  
+Variable respuesta: Masa de cebo ingerida (peso final - peso incial)  
+Variables explicatorias: Tratamiento (5 niveles de concentración de bitrex: B0 es el control, B8 es la mayor concentración probada) y Motivación (3 niveles: Baja/Alta/Moribundas).  
+
+Set de datos:  
+
+```{r}
+Cmus
+```
+
+Entonces, DP_mg (diferencia de peso en miligramos) es una variable continua truncada en cero. Acá abajo muestro cómo se distribuye. Se ven muchos ceros que no son "exceso de ceros" porque son ceros reales. Además, se ven algunos mínimos valores negativos que resultaron por error de la balanza o porque las hormigas no comieron y, además, liberaron feromona.  
+
+```{r}
+
+Cmus %>% 
+  ggplot() +
+  geom_bar(aes(x = DP_mg))
+
+```
+
+Boxpot de la variable en cuestión, por tratamiento y motivación:    
+
+```{r}
+
+Cmus %>% 
+  ggplot() +
+  geom_boxplot(aes(x = Tratamiento, y = DP_mg, fill = Tratamiento), show.legend = FALSE) +
+  facet_wrap(~ fct_relevel(Motivacion, "Baja")) +
+  scale_color_brewer(palette = "YlGn", aesthetics = "fill") +
+  labs(
+    title = "C.mus",
+    subtitle = "Consumo de cebo con amargante",
+    y = "Masa de cebo ingerida (mg)",
+    x = "Concentración del amargante"
+  )
+
+```
+
+
+Perfiles:  
+
+```{r}
+
+Cmus %>%
+  group_by(Tratamiento, Motivacion) %>% 
+  summarise(mean = mean(DP_mg)) %>% 
+  ggplot(aes(x = Tratamiento, y = mean, group = Motivacion)) +
+  geom_line(aes(color = Motivacion)) + 
+  geom_point(aes(color = Motivacion)) +
+  labs(
+    title = "Cmus",
+    subtitle = "Perfiles de masa de cebo ingerida",
+    x = "Concentración del amargante",
+    y = "Masa de cebo ingerida media"
+  )
+
+```
+
+Medias de DP por tratamiento y motivación. Esto es curioso porque muchas medias dan 0 (O sea, tuve TODOS ceros!). Eso es problemático porque no tengo variabilidad y no hay mucha estadística que se banque eso, no?  
+
+```{r}
+
+Cmus %>% 
+  group_by(Tratamiento, Motivacion) %>% 
+  summarise(mean = mean(DP_mg))
+
+```
+
+Obviamente no tiene para nada facha de normal, pero vamos con el shapiro:  
+
+```{r}
+
+shapiro.test(Cmus$DP_mg)
+
+```
+
+Debería plantear un modelo con interacción entre Tratamiento y Motivación. Pero no tengo normalidad y la varianza es muy heterocedástica. 
+¿Qué cosas probé?  
+a) Plantear gls modelando varianzas  
+b) Poner ID como factor aleatorio  
+c) Plantear una distribución gamma (valores negativos se tomaron como ceros y se sumó una constante para que no esté truncada en cero).  
+d) Gamma inflada en cero.  
+e) Colapsar factores.  
+d) Bernoulli para ver Come/No come para ver diferencias entre motivaciones y después analizar individualmente las comparaciones entre casos que comían.  
+e) No paramétricos. La cagada es que no hay no paramétricos para dos factores.  
+
+*NADA FUNCIONÓ*  
+Los gls fueron muy mal. Claramente no es una variable normal y no hay parche que le venga bien.  
+La distribución gamma era mi comodín salvador, pero no pude lograr que ajuste bien. Gamma inflada en cero no funcionó porque tuve problemas de convergencia cuando planteé la interacción. A continuación va mi intento de modelo gamma:  
+
+Primero, modificar mi variable para que le vaya bien la gamma:  
+
+```{r}
+
+Cmus4Gamma <- Cmus %>% 
+  filter(DP_mg < 0) %>% 
+  mutate(DP_mg = 0) 
+
+Cmus4Gamma <- full_join(Cmus4Gamma, Cmus) %>% 
+  filter(DP_mg >= 0) %>% 
+  mutate(DP_mg = DP_mg + 0.0000000001)
+
+```
+
+Chequeé que las medias y varianza de Cmus y Cmus4Gamma sean iguales. Eso está OK.  
+Modelo gamma:    
+
+```{r}
+
+gamma <- glm(DP_mg ~ Tratamiento * Motivacion, family = Gamma(link = "inverse"), data = Cmus4Gamma)
+
+anova(gamma, test = "Chisq")
+summary(gamma)
+
+```
+
+Residuos vs predichos, homogeneidad y sobredispersión:  
+
+```{r}
+r_gamma <- residuals(gamma, type = "pearson")
+pred_gamma <- fitted(gamma)
+plot(pred_gamma, r_gamma, xlab = "Predichos", ylab = "Residuos estandarizados", main = "Grafico de dispersion de RE vs PRED", abline (0,0))
+
+boxplot(r_gamma ~ Cmus$Tratamiento, xlab = "Tratamiento", ylab = "Residuos estandarizados")
+
+leveneTest(DP_mg ~ Tratamiento * Motivacion, Cmus, center = "median")
+
+sum(residuals(gamma, type = "pearson")^2)/df.residual(gamma)
+```
+
+La sobredispersión me da muy alta, pero como Gamma no asume que la media tiene que aumentar igual que la varianza, no debería tener que lidiar por esto, CREO. NO ESTOY SEGURA.  
+De todos modos, los gráficos de RE vs PRED dan horrible y eso, entiendo, sí debería estar OK.  
+Para salir de esta, intenté modelar una gamma inflada en cero, pero me tira error en el número de iteraciones. También probé incorporar ID como factor aleatorio pero tira error con el número de iteraciones:  
+
+```{r}
+
+gammaZ <- glmmTMB(DP_mg ~ Tratamiento * Motivacion, ziformula = ~., data = Cmus)
+
+gammaFactAl <- glmer(DP_mg ~ Tratamiento * Motivacion + (1|ID), family = Gamma(link = "log"), data = Cmus4Gamma)
+
+```
+
+Probé TODO NUEVAMENTE colapsando factores de la siguiente manera:  
+
+```{r}
+CmusBB <- Cmus %>% 
+  mutate(Tratamiento = fct_collapse(Tratamiento,
+                                    B0 = "B0",
+                                    B1 = "B1",
+                                    BB = c("B2", "B4", "B8")))
+```
+
+Es decir, colapsando B2, B4 y B8.  
+Seguí teniendo problemas de homocedasticidad. Comparando todos los modelos que hice, intenté quedarme con el gamma con colapsados a pesar de que los gráficos de RE vs PRED eran medios feitos (menos que antes) y que seguía teniendo sobredispersión. A pesar de esto, no pude realizar comparaciones múltiples porque me tiró: "covariate interactions found -- default contrast might be inappropriate".  
+
+Después probé analizar la motivación baja por separado, porque era el que más ceros me aportaba. Tampoco anduvo.  
+
+Terminé con los no paramétricos =) haciendo la sigueinte chanchada:  
+
+## No paramétrico ##  
+
+Para analizar con no paramétricos, como no puedo plantear modelo con dos factores, tuve que subsetear primero, por motivaciones:  
+
+```{r}
+
+CmusAlta <- Cmus %>% 
+  filter(Motivacion == "Alta")
+
+kruskal.test(DP_mg ~ Tratamiento, data = CmusAlta)
+
+```
+
+Y después de kruksal wallis, comparaciones múltiples con método Dunn, que ajusta por Holm:  
+
+```{r}
+
+posthoc.kruskal.dunn.test(DP_mg ~ Tratamiento, data = CmusAlta)
+
+```
+
+Lo mismo para motivación baja:  
+
+```{r}
+
+CmusBaja <- Cmus %>% 
+  filter(Motivacion == "Baja")
+
+posthoc.kruskal.dunn.test(DP_mg ~ Tratamiento, data = CmusBaja)
+
+```
+
+Y para moribundas:  
+
+```{r}
+
+CmusMoribundas <- Cmus %>% 
+  filter(Motivacion == "Moribundas")
+
+posthoc.kruskal.dunn.test(DP_mg ~ Tratamiento, data = CmusMoribundas)
+
+```
+
+Hasta acá creo que es todo legal, no? Pero si yo quiero mostrar que entre motivaciones cambia la ingesta, no puedo obviar la interacción. Además, no sería del todo válido subsetear por motivación y comparar porque debería hacer una corrección del alfa por no tener independencia.  
+Para no tener TANTOS problemas con esto, terminé haciendo SOLAMENTE una comparación, que fue el control, entre motivaciones:  
+
+```{r}
+
+CmusB1 <- Cmus %>% 
+  filter(Tratamiento == "B1")
+
+CmusB1 %>%
+  kruskal.test(DP_mg ~ Motivacion)
+
+posthoc.kruskal.dunn.test(DP_mg ~ Motivacion, data = CmusB1, p.adjust.method = "none")
+
+```
+
+Y bueno, terminé concluyendo con este análisis no paramétrico que NO ME CONVENCE. 
+
+## OPINIONES? SUGERENCIAS? =) =) ##
